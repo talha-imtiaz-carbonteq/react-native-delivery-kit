@@ -1,0 +1,23 @@
+stages:
+  - distribute
+  - submit
+
+default:
+  image: node:20-bullseye
+  cache:
+    key: pnpm-${CI_COMMIT_REF_SLUG}
+    paths:
+      - Propwire/.pnpm-store
+    policy: pull-push
+  before_script:
+    - node -v
+    - npm -v
+    - bash -lc "cd Propwire && corepack enable && corepack prepare pnpm@9.14.2 --activate || true"
+
+eas-build-dev:
+  stage: distribute
+  script:
+    # - bash -lc "cd Propwire && pnpm install --frozen-lockfile"
+    # - bash -lc "cd Propwire && pnpm exec eas build --profile preview --non-interactive"
+      - echo "default child-pipeline.yml"
+

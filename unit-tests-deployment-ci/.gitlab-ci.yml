@@ -1,0 +1,135 @@
+workflow:
+  rules:
+    # 1. Handling: Manual Trigger (The 'Yes' path in the diagram)
+    - if: $CI_PIPELINE_SOURCE == 'web'
+    
+    # 2. Handling: Merge Request to main (The 'MR to main' arrow)
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'main'
+    
+    # 3. Handling: Standard Merge Requests (Feature -> dev)
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    
+    # 4. Handling: Merge to dev or main (The 'main' and 'dev' blocks)
+    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == 'dev' || $CI_COMMIT_BRANCH == 'main')
+
+stages:
+  - lint-audit
+  - test
+  - decide
+  - distribute
+  - submit
+
+default:
+  image: node:20-bullseye
+  # ... (cache and before_script remaine same)
+
+# Covers: Feature/* -> dev -> Lint
+# Covers: MR to main -> Lint
+lint-audit:
+  stage: lint-audit
+  script:
+    - bash Propwire/scripts/ci/run-lint.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'web'
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+
+    # 3. SKIP if this is a Merge Commit (Prevents the post-approval run)
+    # - if: $CI_COMMIT_MESSAGE =~ /^Merge branch/
+      # when: never
+    
+    # 4. Run on Push to dev/main ONLY IF no MR is open (Prevents double-run on push)
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|main)$/ && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    
+    # 5. Fallback: Run on direct pushes to dev/main
+    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == 'dev' || $CI_COMMIT_BRANCH == 'main')
+
+
+# Covers: Unit-tests
+unit-tests:
+  stage: test
+  script:
+    - bash Propwire/scripts/ci/run-tests.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'web'
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    
+    # 3. SKIP if this is a Merge Commit (Prevents the post-approval run)
+    # - if: $CI_COMMIT_MESSAGE =~ /^Merge branch/
+      # when: never
+    
+    # 4. Run on Push to dev/main ONLY IF no MR is open (Prevents double-run on push)
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|main)$/ && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    
+    # 5. Fallback: Run on direct pushes to dev/main
+    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == 'dev' || $CI_COMMIT_BRANCH == 'main')
+
+  # Test report artifacts (kept for 7 days)
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - Propwire/test-results/junit.xml                # Store test results
+    reports:
+      junit: Propwire/test-results/junit.xml           # Mark as JUnit report for GitLab UI
+
+
+# Logic: "Is Manual Pipeline trigger from UI?"
+# This is the "GATEKEEPER". 
+# If this is a Merge (Push) or an MR, this job DOES NOT RUN.
+# This results in "Job Complete" right after tests, exactly like the diagram.
+# ... (workflow, lint, and unit-tests stages remain as previously defined)
+
+build-decision:
+  stage: decide
+  script:
+    - bash Propwire/scripts/ci/needs-native-build.sh
+    - bash Propwire/scripts/ci/generate-child-pipeline.sh
+    - echo 
+  artifacts:
+    reports:
+      dotenv: Propwire/scripts/ci/build-or-ota.env
+    paths:
+      - Propwire/scripts/ci/child-pipeline.yml
+  rules:
+    # 1. Logic: Merge Request to main from dev
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == "dev"
+    
+    # 2. Logic: Merge Approved / Push to main (Production Build/OTA + Manual Gate)
+    - if: $CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_BRANCH == 'main'
+
+    # 3. Logic: Manual trigger from Web UI (dev or main)
+    - if: $CI_PIPELINE_SOURCE == 'web' && ($CI_COMMIT_BRANCH == 'dev' || $CI_COMMIT_BRANCH == 'main')
+    # --- TEMPORARY TESTING: Uncomment below to allow trigger on any web branch or any MR ---
+    # - if: $CI_PIPELINE_SOURCE == 'web'
+    # - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    # --------------------------------------------------------------------------------------
+
+eas-distribute:
+  stage: distribute
+  variables:
+    # Pass the tokens explicitly into the child pipeline
+    E2E_PIPELINE_TOKEN: $E2E_PIPELINE_TOKEN
+    E2E_PROJECT_ID: $E2E_PROJECT_ID
+    EXPO_TOKEN: $EXPO_TOKEN
+    EXPO_PROJECT_ID: $EXPO_PROJECT_ID
+    OTA_UPDATE_AUTH_PROD: $OTA_UPDATE_AUTH_PROD
+    OTA_UPDATE_AUTH_PREVIEW: $OTA_UPDATE_AUTH_PREVIEW
+
+  trigger:
+    include:
+      - artifact: Propwire/scripts/ci/child-pipeline.yml
+        job: build-decision
+    forward:
+      # Forward pipeline variables (from web UI, parent) to child
+      pipeline_variables: true
+      # Forward YAML‑defined variables (above) to child
+      yaml_variables: true
+    strategy: depend
+  
+  rules:
+    # Must mirror the build-decision logic to ensure the trigger has an artifact to use
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == "dev"
+    - if: $CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_BRANCH == 'main'
+    - if: $CI_PIPELINE_SOURCE == 'web' && ($CI_COMMIT_BRANCH == 'dev' || $CI_COMMIT_BRANCH == 'main')

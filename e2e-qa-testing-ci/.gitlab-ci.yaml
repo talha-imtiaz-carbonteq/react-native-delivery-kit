@@ -1,0 +1,180 @@
+stages:
+  - test
+
+variables:
+  PUPPETEER_CACHE_DIR: "/home/gitlab-runner/.cache/puppeteer"
+  PNPM_HOME: ".pnpm-store"
+
+default:
+  cache:
+      key:
+        files:
+          - pnpm-lock.yaml
+      paths:
+        - .pnpm-store
+      policy: pull
+
+run_appium_tests:
+  stage: test
+  image: node:20-slim
+
+  # Ensures sequential execution for BrowserStack 1-parallel limit
+  resource_group: "browserstack_global_limit"
+
+  parallel:
+    matrix:
+      - PLATFORM: ["android", "ios"]
+
+  rules:
+    # 1. Automatic trigger from CI
+    - if: '$CI_PIPELINE_SOURCE == "trigger" && $EXPO_PLATFORM == "android" && $PLATFORM == "android"'
+    - if: '$CI_PIPELINE_SOURCE == "trigger" && $EXPO_PLATFORM == "ios" && $PLATFORM == "ios"'
+    - if: '$CI_PIPELINE_SOURCE == "trigger" && ($EXPO_PLATFORM == null || $EXPO_PLATFORM == "")'
+
+    # 2. Manual run from Web UI — require variables
+    - if: '$CI_PIPELINE_SOURCE == "web" && $EXPO_PLATFORM == "android" && $PLATFORM == "android"'
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "web" && $EXPO_PLATFORM == "ios" && $PLATFORM == "ios"'
+      when: manual
+
+    # Block all other cases
+    - when: never
+
+  before_script:
+    # ---------------------------------------------
+    # System deps – optimized by grouping; still same logic
+    # ---------------------------------------------
+    - export PATH="$PNPM_HOME:$PATH" 
+    - apt-get update -qq
+    - |
+      apt-get install -y \
+        jq curl libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+        libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+        libxext6 libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 python3
+    # pnpm enablement
+    - corepack enable
+    - corepack prepare pnpm@latest --activate
+
+    # Install JS deps (cached)
+    - pnpm install --prefer-offline
+
+    # Puppeteer chrome (cached)
+    - npx puppeteer browsers install chrome || echo "⚠️ Non-fatal Chrome install"
+
+  script:
+    - |
+      echo "🔍 STARTING: $PLATFORM"
+      echo "🔍 Target EXPO_BUILD_URL:$EXPO_BUILD_URL"
+
+
+      # -----------------------------
+      # Handle IS_OTA variable
+      # -----------------------------
+      IS_OTA="${IS_OTA:-false}"   # default false if not passed
+      echo "ℹ IS_OTA=$IS_OTA"      # print the value
+    
+
+      # 1. Create a unique fingerprint from the Build URL itself
+      # This is unique to the file, not the version number.
+      # While the URL is guaranteed to be unique, it will expire. Expo's data retention policy states that build artifacts (and their associated buildUrl links) are automatically deleted from their servers 30 days after the build finishes.
+      
+
+      URL_FINGERPRINT=$(echo -n "$EXPO_BUILD_URL" | md5sum | cut -c1-10)
+
+      # 2. Combine with platform to ensure Android/iOS are tracked separately
+      CUSTOM_ID="propwire_${PLATFORM}_${URL_FINGERPRINT}"
+
+      echo "📦 Build Fingerprint: $URL_FINGERPRINT"
+      echo "🆔 BrowserStack Custom ID: $CUSTOM_ID"
+
+
+      # Validate build URL before hitting BrowserStack
+      curl -Ifs "$EXPO_BUILD_URL" || { echo "❌ EXPO_BUILD_URL is invalid/unreachable"; exit 1; }
+
+      # BrowserStack Upload Logic (same logic; safer handling)
+      RESPONSE=$(curl -s -u "$BROWSERSTACK_USER:$BROWSERSTACK_KEY" \
+        "https://api-cloud.browserstack.com/app-automate/recent_apps")
+
+      # Ensure RESPONSE is valid JSON
+      if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
+        echo "❌ BrowserStack API returned non-JSON response:"
+        echo "$RESPONSE"
+        exit 1
+      fi
+
+      # Safe parse BrowserStack response
+      EXISTS=$(echo "$RESPONSE" | jq -r --arg CID "$CUSTOM_ID" '
+        # Case 1: Response is an array → search normally
+        if type == "array" then
+          .[] | select(.custom_id == $CID) | .app_url
+        else
+          # Case 2: No results → return empty string
+          empty
+        end
+      ' | head -n 1)
+
+      if [ ! -z "$EXISTS" ] && [ "$EXISTS" != "null" ]; then
+        echo "✅ Using existing $PLATFORM app: $EXISTS"
+        export BROWSERSTACK_APP_ID=$EXISTS
+      else
+        echo "🚀 Uploading new $PLATFORM build..."
+        UPLOAD_RESPONSE=$(curl -s -u "$BROWSERSTACK_USER:$BROWSERSTACK_KEY" \
+          -X POST "https://api-cloud.browserstack.com/app-automate/upload" \
+          -F "url=$EXPO_BUILD_URL" \
+          -F "custom_id=$CUSTOM_ID")
+
+        export BROWSERSTACK_APP_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.app_url // empty')
+      fi
+
+      if [ -z "$BROWSERSTACK_APP_ID" ]; then
+        echo "❌ Failed to retrieve BrowserStack App ID"
+        exit 1
+      fi
+
+      # Export platform-specific variable
+      if [ "$PLATFORM" == "android" ]; then
+        export BROWSERSTACK_APP_ID_ANDROID="$BROWSERSTACK_APP_ID"
+      else
+        export BROWSERSTACK_APP_ID_IOS="$BROWSERSTACK_APP_ID"
+      fi
+
+      # Execute platform-specific tests (unchanged)
+      echo "▶ Running tests for $PLATFORM..."
+      set +e
+      if [ "$PLATFORM" == "android" ]; then
+        if [ "$TEST_TYPE" == "regression" ]; then
+          pnpm test:android:regression
+        else
+          pnpm test:android:smoke
+        fi
+      else
+        if [ "$TEST_TYPE" == "regression" ]; then
+          pnpm test:ios:regression
+        else
+          pnpm test:ios:smoke
+        fi
+      fi
+
+      TEST_EXIT_CODE=$?
+      set -e
+
+      echo $TEST_EXIT_CODE > /tmp/test_exit_code_${PLATFORM}.txt
+
+  after_script:
+    - |
+      export TEST_PLATFORM=$PLATFORM
+      EXIT_CODE=$(cat /tmp/test_exit_code_${PLATFORM}.txt 2>/dev/null || echo "1")
+
+      python3 ops/send_report.py || echo "⚠️ Report failed to send"
+
+      if [ "$EXIT_CODE" -ne 0 ]; then
+        echo "❌ Tests failed for $PLATFORM"
+        exit 1
+      fi
+
+  artifacts:
+    when: always
+    paths:
+      # Same dynamic report path resolution
+      - "${PLATFORM}/html-reports/"
+    expire_in: 1 week
